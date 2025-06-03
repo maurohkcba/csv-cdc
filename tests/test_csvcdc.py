@@ -12,13 +12,7 @@ from csvcdc import CSVCDC, CSVCDCResult, OutputFormatter
 
 class TestCSVCDC:
     """Test cases for CSVCDC class"""
-    
-    @pytest.fixture
-    def temp_dir(self):
-        """Create temporary directory for test files"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            yield temp_dir
-    
+        
     @pytest.fixture
     def sample_csv_files(self, temp_dir):
         """Create sample CSV files for testing"""
