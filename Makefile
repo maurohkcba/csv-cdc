@@ -86,39 +86,39 @@ ci-test:
 # Performance testing
 perf-test:
 	@echo "Running performance tests..."
-	$(PYTHON) -c "
-import time
-import tempfile
-import os
-from csvcdc import CSVCDC
-
-# Generate test data
+	$(PYTHON) -c "\
+import time;\
+import tempfile;\
+import os;\
+from csvcdc import CSVCDC;\
+\
+# Generate test data\
 with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f1, \
-     tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f2:
-    
-    # Write 10k rows
-    f1.write('id,name,value\n')
-    f2.write('id,name,value\n')
-    
-    for i in range(10000):
-        f1.write(f'{i},Item_{i},{i*10}\n')
-        f2.write(f'{i},Item_{i},{i*11}\n')  # Different values
-    
-    f1.flush()
-    f2.flush()
-    
-    # Test performance
-    start = time.time()
-    cdc = CSVCDC(primary_key=[0], progressbar=0)
-    result = cdc.compare(f1.name, f2.name)
-    end = time.time()
-    
-    print(f'Processed 10k rows in {end-start:.2f} seconds')
-    print(f'Found {len(result.modifications)} modifications')
-    
-    # Cleanup
-    os.unlink(f1.name)
-    os.unlink(f2.name)
+     tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f2: \
+    \
+    # Write 10k rows\
+    f1.write('id,name,value\n'); \
+    f2.write('id,name,value\n'); \
+    \
+    for i in range(10000): \
+        f1.write(f'{i},Item_{i},{i*10}\n'); \
+        f2.write(f'{i},Item_{i},{i*11}\n');  # Different values\
+    \
+    f1.flush(); \
+    f2.flush(); \
+    \
+    # Test performance\
+    start = time.time(); \
+    cdc = CSVCDC(primary_key=[0], progressbar=0); \
+    result = cdc.compare(f1.name, f2.name); \
+    end = time.time(); \
+    \
+    print(f'Processed 10k rows in {end-start:.2f} seconds'); \
+    print(f'Found {len(result.modifications)} modifications'); \
+    \
+    # Cleanup\
+    os.unlink(f1.name); \
+    os.unlink(f2.name); \
 "
 
 # Help
