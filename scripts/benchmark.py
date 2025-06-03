@@ -1,7 +1,3 @@
-"""
-Benchmark script for CSV CDC performance testing
-"""
-
 import time
 import tempfile
 import os
@@ -73,35 +69,53 @@ def generate_delta_data(base_file, delta_file, change_rate=0.1, addition_rate=0.
             new_row = [new_id] + [f'new_value_{new_id}_{j}' for j in range(1, len(headers))]
             writer.writerow(new_row)
 
+def get_file_size_mb(filepath):
+    """Get file size in MB"""
+    return os.path.getsize(filepath) / (1024 * 1024)
+
+def should_use_large_files(base_file, delta_file, threshold_mb=100):
+    """Determine if large file mode should be used based on file sizes"""
+    total_size = get_file_size_mb(base_file) + get_file_size_mb(delta_file)
+    return total_size > threshold_mb
+
 def measure_performance(base_file, delta_file, config):
     """Measure CDC performance"""
     process = psutil.Process()
     initial_memory = process.memory_info().rss / (1024 * 1024)  # MB
+    peak_memory = initial_memory
+    
+    # Monitor memory usage during execution
+    def monitor_memory():
+        nonlocal peak_memory
+        current_memory = process.memory_info().rss / (1024 * 1024)
+        peak_memory = max(peak_memory, current_memory)
     
     start_time = time.time()
     
     # Create CDC instance
     cdc = CSVCDC(**config)
+    monitor_memory()
     
     # Perform comparison
     result = cdc.compare(base_file, delta_file)
+    monitor_memory()
     
     end_time = time.time()
     final_memory = process.memory_info().rss / (1024 * 1024)  # MB
     
     # Calculate metrics
-    base_size = os.path.getsize(base_file) / (1024 * 1024)  # MB
-    delta_size = os.path.getsize(delta_file) / (1024 * 1024)  # MB
+    base_size = get_file_size_mb(base_file)
+    delta_size = get_file_size_mb(delta_file)
     total_size = base_size + delta_size
     
     execution_time = end_time - start_time
     memory_used = final_memory - initial_memory
-    throughput = total_size / execution_time  # MB/s
+    throughput = total_size / execution_time if execution_time > 0 else 0
     
     return {
         'execution_time': execution_time,
         'memory_used': memory_used,
-        'peak_memory': final_memory,
+        'peak_memory': peak_memory,
         'throughput': throughput,
         'base_file_size': base_size,
         'delta_file_size': delta_size,
@@ -109,24 +123,32 @@ def measure_performance(base_file, delta_file, config):
         'additions': len(result.additions),
         'modifications': len(result.modifications),
         'deletions': len(result.deletions),
-        'total_changes': len(result.additions) + len(result.modifications) + len(result.deletions)
+        'total_changes': len(result.additions) + len(result.modifications) + len(result.deletions),
+        'large_files_mode': config.get('largefiles', 0),
+        'chunk_size': config.get('chunk_size', 500000)
     }
 
 def run_benchmark_suite():
     """Run comprehensive benchmark suite"""
     
-    # Test configurations
+    # Test configurations - expanded to include large file tests
     test_configs = [
         {'rows': 1000, 'cols': 5, 'name': 'small'},
         {'rows': 10000, 'cols': 5, 'name': 'medium'},
         {'rows': 100000, 'cols': 5, 'name': 'large'},
+        {'rows': 500000, 'cols': 5, 'name': 'very_large'},
         {'rows': 10000, 'cols': 20, 'name': 'wide'},
+        {'rows': 50000, 'cols': 20, 'name': 'large_wide'},
     ]
     
+    # CDC configurations - now includes large file options
     cdc_configs = [
-        {'primary_key': [0], 'progressbar': 0, 'autopk': 0, 'name': 'basic'},
-        {'primary_key': [0], 'progressbar': 0, 'autopk': 1, 'name': 'autopk'},
-        {'primary_key': [0, 1], 'progressbar': 0, 'autopk': 0, 'name': 'composite_pk'},
+        {'primary_key': [0], 'progressbar': 0, 'autopk': 0, 'largefiles': 0, 'name': 'basic'},
+        {'primary_key': [0], 'progressbar': 0, 'autopk': 1, 'largefiles': 0, 'name': 'autopk'},
+        {'primary_key': [0, 1], 'progressbar': 0, 'autopk': 0, 'largefiles': 0, 'name': 'composite_pk'},
+        {'primary_key': [0], 'progressbar': 0, 'autopk': 0, 'largefiles': 1, 'chunk_size': 100000, 'name': 'large_files_100k'},
+        {'primary_key': [0], 'progressbar': 0, 'autopk': 0, 'largefiles': 1, 'chunk_size': 500000, 'name': 'large_files_500k'},
+        {'primary_key': [0], 'progressbar': 0, 'autopk': 1, 'largefiles': 1, 'chunk_size': 500000, 'name': 'large_files_autopk'},
     ]
     
     results = []
@@ -144,14 +166,41 @@ def run_benchmark_suite():
             generate_test_data(test_config['rows'], test_config['cols'], base_file)
             generate_delta_data(base_file, delta_file)
             
-            for cdc_config in cdc_configs:
+            # Check file sizes
+            total_size_mb = get_file_size_mb(base_file) + get_file_size_mb(delta_file)
+            print(f"    📁 Total file size: {total_size_mb:.1f} MB")
+            
+            # Determine which configs to test based on dataset size
+            configs_to_test = cdc_configs.copy()
+            
+            # For small datasets, skip large file configs
+            if total_size_mb < 50:
+                configs_to_test = [c for c in configs_to_test if c.get('largefiles', 0) == 0]
+                print(f"    ℹ️  Skipping large file configs for small dataset")
+            
+            # For very large datasets, prioritize large file configs
+            elif total_size_mb > 200:
+                print(f"    ⚡ Large dataset detected, testing both modes")
+            
+            for cdc_config in configs_to_test:
                 print(f"  🔧 Testing {cdc_config['name']} configuration...")
                 
                 # Extract config for CDC
                 config = {k: v for k, v in cdc_config.items() if k != 'name'}
                 
                 try:
+                    # Add timeout for very long operations
+                    import signal
+                    
+                    def timeout_handler(signum, frame):
+                        raise TimeoutError("Benchmark timed out after 300 seconds")
+                    
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(300)  # 5 minute timeout
+                    
                     metrics = measure_performance(base_file, delta_file, config)
+                    
+                    signal.alarm(0)  # Cancel timeout
                     
                     result = {
                         'test_name': test_config['name'],
@@ -162,9 +211,21 @@ def run_benchmark_suite():
                     results.append(result)
                     
                     print(f"    ⏱️  Time: {metrics['execution_time']:.2f}s")
-                    print(f"    💾 Memory: {metrics['memory_used']:.1f}MB")
+                    print(f"    💾 Memory: {metrics['memory_used']:.1f}MB (Peak: {metrics['peak_memory']:.1f}MB)")
                     print(f"    🚀 Throughput: {metrics['throughput']:.1f}MB/s")
                     print(f"    📝 Changes: {metrics['total_changes']}")
+                    if metrics['large_files_mode']:
+                        print(f"    📦 Chunk size: {metrics['chunk_size']:,}")
+                    
+                except TimeoutError as e:
+                    print(f"    ⏰ Timeout: {e}")
+                    result = {
+                        'test_name': test_config['name'],
+                        'cdc_config': cdc_config['name'],
+                        'dataset': test_config,
+                        'error': 'timeout'
+                    }
+                    results.append(result)
                     
                 except Exception as e:
                     print(f"    ❌ Error: {e}")
@@ -175,6 +236,12 @@ def run_benchmark_suite():
                         'error': str(e)
                     }
                     results.append(result)
+                
+                finally:
+                    try:
+                        signal.alarm(0)  # Ensure timeout is cancelled
+                    except:
+                        pass
     
     return results
 
@@ -187,9 +254,15 @@ def generate_report(results, output_file):
     
     # Generate summary
     print(f"\n📋 Benchmark Results Summary")
-    print("=" * 60)
+    print("=" * 80)
     
     successful_results = [r for r in results if 'metrics' in r]
+    failed_results = [r for r in results if 'error' in r]
+    
+    if failed_results:
+        print(f"\n⚠️  {len(failed_results)} failed benchmark(s):")
+        for result in failed_results:
+            print(f"  - {result['test_name']} / {result['cdc_config']}: {result['error']}")
     
     if not successful_results:
         print("No successful benchmark runs")
@@ -204,15 +277,17 @@ def generate_report(results, output_file):
         by_test[test_name].append(result)
     
     # Print summary table
-    print(f"{'Dataset':<12} {'Config':<12} {'Time(s)':<8} {'Memory(MB)':<12} {'Throughput(MB/s)':<15} {'Changes':<8}")
-    print("-" * 75)
+    print(f"\n{'Dataset':<15} {'Config':<20} {'Time(s)':<8} {'Memory(MB)':<12} {'Peak(MB)':<10} {'Throughput':<12} {'Changes':<8} {'Mode':<6}")
+    print("-" * 100)
     
     for test_name, test_results in by_test.items():
         for result in test_results:
             metrics = result['metrics']
-            print(f"{test_name:<12} {result['cdc_config']:<12} "
+            mode = "Chunk" if metrics['large_files_mode'] else "Normal"
+            print(f"{test_name:<15} {result['cdc_config']:<20} "
                   f"{metrics['execution_time']:<8.2f} {metrics['memory_used']:<12.1f} "
-                  f"{metrics['throughput']:<15.1f} {metrics['total_changes']:<8}")
+                  f"{metrics['peak_memory']:<10.1f} {metrics['throughput']:<12.1f} "
+                  f"{metrics['total_changes']:<8} {mode:<6}")
     
     # Performance insights
     print(f"\n🔍 Performance Insights:")
@@ -227,10 +302,29 @@ def generate_report(results, output_file):
     print(f"Most memory efficient: {best_memory['metrics']['memory_used']:.1f} MB "
           f"({best_memory['test_name']} - {best_memory['cdc_config']})")
     
+    # Lowest peak memory
+    best_peak_memory = min(successful_results, key=lambda x: x['metrics']['peak_memory'])
+    print(f"Lowest peak memory: {best_peak_memory['metrics']['peak_memory']:.1f} MB "
+          f"({best_peak_memory['test_name']} - {best_peak_memory['cdc_config']})")
+    
     # Fastest execution
     fastest = min(successful_results, key=lambda x: x['metrics']['execution_time'])
     print(f"Fastest execution: {fastest['metrics']['execution_time']:.2f}s "
           f"({fastest['test_name']} - {fastest['cdc_config']})")
+    
+    # Large files vs normal mode comparison
+    large_file_results = [r for r in successful_results if r['metrics']['large_files_mode']]
+    normal_results = [r for r in successful_results if not r['metrics']['large_files_mode']]
+    
+    if large_file_results and normal_results:
+        print(f"\n📊 Mode Comparison:")
+        avg_memory_normal = sum(r['metrics']['peak_memory'] for r in normal_results) / len(normal_results)
+        avg_memory_large = sum(r['metrics']['peak_memory'] for r in large_file_results) / len(large_file_results)
+        print(f"Average peak memory - Normal: {avg_memory_normal:.1f}MB, Chunked: {avg_memory_large:.1f}MB")
+        
+        avg_throughput_normal = sum(r['metrics']['throughput'] for r in normal_results) / len(normal_results)
+        avg_throughput_large = sum(r['metrics']['throughput'] for r in large_file_results) / len(large_file_results)
+        print(f"Average throughput - Normal: {avg_throughput_normal:.1f}MB/s, Chunked: {avg_throughput_large:.1f}MB/s")
 
 def main():
     parser = argparse.ArgumentParser(description='CSV CDC Benchmark Tool')
@@ -240,6 +334,12 @@ def main():
                         help='Run custom benchmark with specific files')
     parser.add_argument('--base-file', help='Base CSV file for custom benchmark')
     parser.add_argument('--delta-file', help='Delta CSV file for custom benchmark')
+    parser.add_argument('--largefiles', type=int, default=None, choices=[0, 1],
+                        help='Force large files mode (auto-detect if not specified)')
+    parser.add_argument('--chunk-size', type=int, default=500000,
+                        help='Chunk size for large file processing')
+    parser.add_argument('--compare-modes', action='store_true',
+                        help='Compare both normal and large file modes')
     
     args = parser.parse_args()
     
@@ -252,12 +352,62 @@ def main():
         print(f"Base file: {args.base_file}")
         print(f"Delta file: {args.delta_file}")
         
-        config = {'primary_key': [0], 'progressbar': 1, 'autopk': 0}
-        metrics = measure_performance(args.base_file, args.delta_file, config)
+        base_size = get_file_size_mb(args.base_file)
+        delta_size = get_file_size_mb(args.delta_file)
+        total_size = base_size + delta_size
+        
+        print(f"File sizes: Base={base_size:.1f}MB, Delta={delta_size:.1f}MB, Total={total_size:.1f}MB")
+        
+        # Determine large files mode
+        if args.largefiles is None:
+            use_large_files = should_use_large_files(args.base_file, args.delta_file)
+            print(f"Auto-detected large files mode: {use_large_files}")
+        else:
+            use_large_files = bool(args.largefiles)
+            print(f"Forced large files mode: {use_large_files}")
+        
+        configs_to_test = []
+        
+        if args.compare_modes:
+            # Test both modes
+            configs_to_test = [
+                {'primary_key': [0], 'progressbar': 1, 'autopk': 0, 'largefiles': 0, 'name': 'normal_mode'},
+                {'primary_key': [0], 'progressbar': 1, 'autopk': 0, 'largefiles': 1, 'chunk_size': args.chunk_size, 'name': 'chunked_mode'}
+            ]
+        else:
+            # Test single mode
+            config = {
+                'primary_key': [0], 
+                'progressbar': 1, 
+                'autopk': 0, 
+                'largefiles': 1 if use_large_files else 0,
+                'name': 'chunked_mode' if use_large_files else 'normal_mode'
+            }
+            if use_large_files:
+                config['chunk_size'] = args.chunk_size
+            configs_to_test = [config]
         
         print(f"\n📊 Results:")
-        for key, value in metrics.items():
-            print(f"  {key}: {value}")
+        for config in configs_to_test:
+            print(f"\n🔧 Testing {config['name']}...")
+            test_config = {k: v for k, v in config.items() if k != 'name'}
+            
+            try:
+                metrics = measure_performance(args.base_file, args.delta_file, test_config)
+                
+                print(f"  ⏱️  Execution time: {metrics['execution_time']:.2f}s")
+                print(f"  💾 Memory used: {metrics['memory_used']:.1f}MB")
+                print(f"  📈 Peak memory: {metrics['peak_memory']:.1f}MB") 
+                print(f"  🚀 Throughput: {metrics['throughput']:.1f}MB/s")
+                print(f"  📝 Total changes: {metrics['total_changes']}")
+                print(f"    - Additions: {metrics['additions']}")
+                print(f"    - Modifications: {metrics['modifications']}")
+                print(f"    - Deletions: {metrics['deletions']}")
+                if metrics['large_files_mode']:
+                    print(f"  📦 Chunk size: {metrics['chunk_size']:,}")
+                    
+            except Exception as e:
+                print(f"  ❌ Error: {e}")
     
     else:
         print("🚀 Starting CSV CDC Benchmark Suite")

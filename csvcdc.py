@@ -6,6 +6,7 @@ from typing import Dict, List, Tuple, Set, Any, Optional, Union
 from collections import defaultdict
 import csv
 from io import StringIO
+import os
 
 # High-performance libraries
 import pandas as pd
@@ -30,7 +31,8 @@ class CSVCDC:
     
     def __init__(self, separator: str = ',', primary_key: List[int] = None, 
                  columns: List[int] = None, ignore_columns: List[int] = None,
-                 include_columns: List[int] = None, progressbar: int = 1, autopk: int = 0):
+                 include_columns: List[int] = None, progressbar: int = 1, 
+                 autopk: int = 0, largefiles: int = 0, chunk_size: int = 50000):
         self.separator = separator if separator != '\\t' else '\t'
         self.primary_key = primary_key or [0]
         self.columns = columns
@@ -38,7 +40,29 @@ class CSVCDC:
         self.include_columns = include_columns
         self.progressbar = progressbar
         self.autopk = autopk
+        self.largefiles = largefiles
+        self.chunk_size = chunk_size
         
+    def _estimate_file_rows(self, filepath: str) -> int:
+        """Estimate number of rows in file for memory planning"""
+        try:
+            file_size = os.path.getsize(filepath)
+            # Sample first few lines to estimate average line length
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                sample_lines = []
+                for i, line in enumerate(f):
+                    if i >= 100:  # Sample first 100 lines
+                        break
+                    sample_lines.append(len(line.encode('utf-8')))
+                
+                if sample_lines:
+                    avg_line_length = sum(sample_lines) / len(sample_lines)
+                    estimated_rows = int(file_size / avg_line_length)
+                    return estimated_rows
+        except Exception:
+            pass
+        return 0
+    
     def _read_csv_optimized(self, filepath: str) -> pl.DataFrame:
         """Read CSV using Polars for maximum performance"""
         try:
@@ -48,7 +72,7 @@ class CSVCDC:
                 separator=self.separator,
                 has_header=False,  # Treat all rows as data
                 ignore_errors=True,
-                low_memory=False
+                low_memory=self.largefiles == 1  # Use low memory mode for large files
             )
             return df
         except Exception:
@@ -59,23 +83,62 @@ class CSVCDC:
                 header=None, 
                 dtype=str,
                 na_filter=False,
-                engine='c'  # Use C engine for speed
+                engine='c',  # Use C engine for speed
+                chunksize=self.chunk_size if self.largefiles == 1 else None
             )
-            return pl.from_pandas(df_pandas)
+            
+            if self.largefiles == 1:
+                # For large files, we'll handle chunks separately
+                return df_pandas
+            else:
+                return pl.from_pandas(df_pandas)
     
-    def _detect_primary_key(self, base_df: pl.DataFrame, delta_df: pl.DataFrame, sample_size: int = 100) -> List[int]:
+    def _read_csv_chunked(self, filepath: str):
+        """Generator that yields chunks of the CSV file"""
+        try:
+            # Use pandas chunked reading
+            chunk_reader = pd.read_csv(
+                filepath,
+                sep=self.separator,
+                header=None,
+                dtype=str,
+                na_filter=False,
+                engine='c',
+                chunksize=self.chunk_size
+            )
+            
+            for chunk in chunk_reader:
+                yield pl.from_pandas(chunk)
+                
+        except Exception as e:
+            if self.progressbar:
+                print(f"Error reading file in chunks: {e}", file=sys.stderr)
+            raise
+    
+    def _detect_primary_key(self, base_file: str, delta_file: str, sample_size: int = 1000) -> List[int]:
         """Automatically detect primary key by analyzing column uniqueness and matching rates"""
         if self.progressbar:
             print("Auto-detecting primary key...", file=sys.stderr)
         
-        base_sample_size = min(sample_size, len(base_df))
-        delta_sample_size = min(sample_size, len(delta_df))
+        # For large files, read smaller samples
+        if self.largefiles == 1:
+            # Read just the first chunk for analysis
+            base_chunk = next(self._read_csv_chunked(base_file))
+            delta_chunk = next(self._read_csv_chunked(delta_file))
+            
+            base_sample = base_chunk.head(min(sample_size, len(base_chunk))).to_numpy().astype(str)
+            delta_sample = delta_chunk.head(min(sample_size, len(delta_chunk))).to_numpy().astype(str)
+        else:
+            base_df = self._read_csv_optimized(base_file)
+            delta_df = self._read_csv_optimized(delta_file)
+            
+            base_sample_size = min(sample_size, len(base_df))
+            delta_sample_size = min(sample_size, len(delta_df))
+            
+            base_sample = base_df.head(base_sample_size).to_numpy().astype(str)
+            delta_sample = delta_df.head(delta_sample_size).to_numpy().astype(str)
         
-        # Sample data for analysis
-        base_sample = base_df.head(base_sample_size).to_numpy().astype(str)
-        delta_sample = delta_df.head(delta_sample_size).to_numpy().astype(str)
-        
-        total_columns = base_df.width
+        total_columns = base_sample.shape[1]
         best_pk = [0]  # default fallback
         best_score = 0
         
@@ -161,6 +224,50 @@ class CSVCDC:
         else:
             return list(range(total_columns))
     
+    def _create_hash_map_chunked(self, filepath: str, desc: str = "Processing") -> Dict[int, Tuple[int, str]]:
+        """Create hash map using chunked processing for large files"""
+        hash_map = {}
+        chunk_count = 0
+        
+        if self.progressbar:
+            print(f"{desc} (chunked mode)...", file=sys.stderr)
+        
+        for chunk_df in self._read_csv_chunked(filepath):
+            chunk_count += 1
+            total_columns = chunk_df.width
+            compare_columns = self._get_effective_columns(total_columns)
+            
+            # Convert chunk to numpy for vectorized operations
+            data = chunk_df.to_numpy().astype(str)
+            
+            # Setup progress bar for chunk
+            progress_iter = range(len(data))
+            if self.progressbar:
+                progress_iter = tqdm(progress_iter, desc=f"{desc} - Chunk {chunk_count}", file=sys.stderr, leave=False)
+            
+            for i in progress_iter:
+                row = data[i]
+                
+                # Create primary key hash
+                pk_values = [row[j] for j in self.primary_key if j < len(row)]
+                pk_string = self.separator.join(pk_values)
+                pk_hash = xxhash.xxh64(pk_string.encode('utf-8')).intdigest()
+                
+                # Create row hash for comparison columns
+                compare_values = [row[j] for j in compare_columns if j < len(row)]
+                row_string = self.separator.join(compare_values)
+                row_hash = xxhash.xxh64(row_string.encode('utf-8')).intdigest()
+                
+                # Store full row string
+                full_row = self.separator.join(row)
+                hash_map[pk_hash] = (row_hash, full_row)
+            
+            # Force garbage collection after each chunk
+            del data
+            del chunk_df
+        
+        return hash_map
+    
     def _create_hash_map(self, df: pl.DataFrame, desc: str = "Processing") -> Dict[int, Tuple[int, str]]:
         """Create optimized hash map using xxhash for speed"""
         hash_map = {}
@@ -196,22 +303,41 @@ class CSVCDC:
     
     def compare(self, base_file: str, delta_file: str) -> CSVCDCResult:
         """Compare two CSV files and return differences"""
-        # Read files with optimized method
-        if self.progressbar:
-            print("Reading base file...", file=sys.stderr)
-        base_df = self._read_csv_optimized(base_file)
-        
-        if self.progressbar:
-            print("Reading delta file...", file=sys.stderr)
-        delta_df = self._read_csv_optimized(delta_file)
         
         # Auto-detect primary key if requested
         if self.autopk:
-            self.primary_key = self._detect_primary_key(base_df, delta_df)
+            if self.largefiles == 1:
+                self.primary_key = self._detect_primary_key(base_file, delta_file)
+            else:
+                # Read files first for non-large file mode
+                if self.progressbar:
+                    print("Reading base file...", file=sys.stderr)
+                base_df = self._read_csv_optimized(base_file)
+                
+                if self.progressbar:
+                    print("Reading delta file...", file=sys.stderr)
+                delta_df = self._read_csv_optimized(delta_file)
+                
+                self.primary_key = self._detect_primary_key(base_df, delta_df)
         
-        # Create hash maps
-        base_map = self._create_hash_map(base_df, "Processing base file")
-        delta_map = self._create_hash_map(delta_df, "Processing delta file")
+        # Create hash maps based on large file mode
+        if self.largefiles == 1:
+            # Use chunked processing for large files
+            base_map = self._create_hash_map_chunked(base_file, "Processing base file")
+            delta_map = self._create_hash_map_chunked(delta_file, "Processing delta file")
+        else:
+            # Regular processing for smaller files
+            if not self.autopk:  # If autopk was used, files are already read
+                if self.progressbar:
+                    print("Reading base file...", file=sys.stderr)
+                base_df = self._read_csv_optimized(base_file)
+                
+                if self.progressbar:
+                    print("Reading delta file...", file=sys.stderr)
+                delta_df = self._read_csv_optimized(delta_file)
+            
+            base_map = self._create_hash_map(base_df, "Processing base file")
+            delta_map = self._create_hash_map(delta_df, "Processing delta file")
         
         result = CSVCDCResult()
         
@@ -350,6 +476,10 @@ def main():
                         help='Show progress bar during processing (default: 1)')
     parser.add_argument('--autopk', type=int, default=0, choices=[0, 1],
                         help='Auto-detect primary key by analyzing data (default: 0)')
+    parser.add_argument('--largefiles', type=int, default=0, choices=[0, 1],
+                        help='Enable large file optimization with chunked processing (default: 0)')
+    parser.add_argument('--chunk-size', type=int, default=500000,
+                        help='Chunk size for large file processing (default: 500000)')
     parser.add_argument('--version', action='version', version='csvcdc-python 1.0.0')
     
     args = parser.parse_args()
@@ -370,7 +500,9 @@ def main():
             ignore_columns=args.ignore_columns,
             include_columns=args.include,
             progressbar=args.progressbar,
-            autopk=args.autopk
+            autopk=args.autopk,
+            largefiles=args.largefiles,
+            chunk_size=args.chunk_size
         )
         
         # Perform comparison

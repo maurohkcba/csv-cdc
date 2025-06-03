@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-06-03
+
+### Added
+- **Large File Support**: New `--largefiles` parameter for processing very large CSV files
+  - Enables chunked processing to handle files that exceed available memory
+  - Default value: 0 (disabled), set to 1 to enable
+- **Chunk Size Control**: New `--chunk-size` parameter to control memory usage
+  - Configurable chunk size for large file processing
+  - Default value: 500,000 rows per chunk
+  - Allows fine-tuning based on available system memory
+
+### Enhanced
+- **Memory Optimization**: Chunked processing prevents memory allocation errors on large datasets
+- **Garbage Collection**: Automatic memory cleanup after each chunk processing
+- **Auto Primary Key Detection**: Now works efficiently with large files using sample-based analysis
+- **Progress Tracking**: Enhanced progress bars for chunked processing with per-chunk indicators
+
+### Technical Improvements
+- Low-memory mode integration with Polars library
+- Fallback mechanisms for chunked vs. regular processing
+- File size estimation for better memory planning
+- Generator-based chunk reading for memory efficiency
+
 ## [1.0.0] - 2025-06-03
 
 ### Added

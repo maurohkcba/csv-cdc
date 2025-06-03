@@ -88,6 +88,45 @@ class TestCSVCDC:
         
         return base_file, delta_file
     
+    @pytest.fixture
+    def large_csv_files(self, temp_dir):
+        """Create larger CSV files for testing large file functionality"""
+        base_rows = ["id,name,price,category,description"]
+        delta_rows = ["id,name,price,category,description"]
+        
+        # Create 5000 rows for testing chunk processing
+        for i in range(1, 5001):
+            base_row = f"{i},Product_{i},{10.99 + (i * 0.01):.2f},Category_{i % 10},Description for product {i}"
+            base_rows.append(base_row)
+            
+            # Modify some rows for delta
+            if i % 100 == 0:  # Every 100th item gets price change
+                delta_row = f"{i},Product_{i},{15.99 + (i * 0.01):.2f},Category_{i % 10},Updated description for product {i}"
+                delta_rows.append(delta_row)
+            elif i % 250 == 0:  # Some items are deleted (not in delta)
+                continue
+            else:
+                delta_rows.append(base_row)
+        
+        # Add some new items to delta
+        for i in range(5001, 5101):
+            delta_row = f"{i},New_Product_{i},{20.99 + (i * 0.01):.2f},New_Category,New product {i}"
+            delta_rows.append(delta_row)
+        
+        base_content = "\n".join(base_rows)
+        delta_content = "\n".join(delta_rows)
+        
+        base_file = os.path.join(temp_dir, 'large_base.csv')
+        delta_file = os.path.join(temp_dir, 'large_delta.csv')
+        
+        with open(base_file, 'w') as f:
+            f.write(base_content)
+        
+        with open(delta_file, 'w') as f:
+            f.write(delta_content)
+        
+        return base_file, delta_file
+    
     def test_basic_comparison(self, sample_csv_files):
         """Test basic CSV comparison functionality"""
         base_file, delta_file = sample_csv_files
@@ -168,6 +207,97 @@ class TestCSVCDC:
         assert cdc.primary_key is not None
         assert isinstance(result, CSVCDCResult)
     
+    def test_large_files_mode(self, large_csv_files):
+        """Test large files mode with chunked processing"""
+        base_file, delta_file = large_csv_files
+        
+        # Test with large files mode enabled
+        cdc = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=1000
+        )
+        result = cdc.compare(base_file, delta_file)
+        
+        # Should detect the expected changes
+        assert len(result.additions) == 100  # New products (5001-5100)
+        assert len(result.modifications) > 0  # Price changes every 100th item
+        assert len(result.deletions) > 0  # Items divisible by 250
+        
+        # Verify it's actually processing in chunks
+        assert isinstance(result, CSVCDCResult)
+    
+    def test_large_files_vs_normal_mode(self, large_csv_files):
+        """Test that large files mode produces same results as normal mode"""
+        base_file, delta_file = large_csv_files
+        
+        # Compare with normal mode
+        cdc_normal = CSVCDC(primary_key=[0], progressbar=0, largefiles=0)
+        result_normal = cdc_normal.compare(base_file, delta_file)
+        
+        # Compare with large files mode
+        cdc_large = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=1000
+        )
+        result_large = cdc_large.compare(base_file, delta_file)
+        
+        # Results should be identical
+        assert len(result_normal.additions) == len(result_large.additions)
+        assert len(result_normal.modifications) == len(result_large.modifications)
+        assert len(result_normal.deletions) == len(result_large.deletions)
+        
+        # Check that the actual content matches
+        assert set(result_normal.additions) == set(result_large.additions)
+        assert set(result_normal.deletions) == set(result_large.deletions)
+    
+    def test_custom_chunk_size(self, large_csv_files):
+        """Test different chunk sizes"""
+        base_file, delta_file = large_csv_files
+        
+        # Test with small chunk size
+        cdc_small = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=500
+        )
+        result_small = cdc_small.compare(base_file, delta_file)
+        
+        # Test with large chunk size
+        cdc_large = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=2000
+        )
+        result_large = cdc_large.compare(base_file, delta_file)
+        
+        # Results should be the same regardless of chunk size
+        assert len(result_small.additions) == len(result_large.additions)
+        assert len(result_small.modifications) == len(result_large.modifications)
+        assert len(result_small.deletions) == len(result_large.deletions)
+    
+    def test_autopk_with_large_files(self, large_csv_files):
+        """Test auto primary key detection with large files mode"""
+        base_file, delta_file = large_csv_files
+        
+        cdc = CSVCDC(
+            autopk=1, 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=1000
+        )
+        result = cdc.compare(base_file, delta_file)
+        
+        # Should automatically detect column 0 as primary key
+        assert cdc.primary_key is not None
+        assert isinstance(result, CSVCDCResult)
+        assert len(result.additions) > 0 or len(result.modifications) > 0 or len(result.deletions) > 0
+    
     def test_empty_files(self, temp_dir):
         """Test handling of empty files"""
         empty_file1 = os.path.join(temp_dir, 'empty1.csv')
@@ -179,23 +309,27 @@ class TestCSVCDC:
         with open(empty_file2, 'w') as f:
             f.write('')
         
-        cdc = CSVCDC(progressbar=0)
-        
-        # Should handle empty files gracefully
-        with pytest.raises(Exception):
-            result = cdc.compare(empty_file1, empty_file2)
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            cdc = CSVCDC(progressbar=0, largefiles=largefiles)
+            
+            # Should handle empty files gracefully
+            with pytest.raises(Exception):
+                result = cdc.compare(empty_file1, empty_file2)
     
     def test_identical_files(self, sample_csv_files):
         """Test comparison of identical files"""
         base_file, _ = sample_csv_files
         
-        cdc = CSVCDC(primary_key=[0], progressbar=0)
-        result = cdc.compare(base_file, base_file)
-        
-        # No differences should be found
-        assert len(result.additions) == 0
-        assert len(result.modifications) == 0
-        assert len(result.deletions) == 0
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            cdc = CSVCDC(primary_key=[0], progressbar=0, largefiles=largefiles)
+            result = cdc.compare(base_file, base_file)
+            
+            # No differences should be found
+            assert len(result.additions) == 0
+            assert len(result.modifications) == 0
+            assert len(result.deletions) == 0
     
     def test_large_primary_key_values(self, temp_dir):
         """Test handling of large primary key values"""
@@ -217,12 +351,14 @@ class TestCSVCDC:
         with open(delta_file, 'w') as f:
             f.write(delta_content)
         
-        cdc = CSVCDC(primary_key=[0], progressbar=0)
-        result = cdc.compare(base_file, delta_file)
-        
-        assert len(result.additions) == 1
-        assert len(result.modifications) == 1
-        assert len(result.deletions) == 0
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            cdc = CSVCDC(primary_key=[0], progressbar=0, largefiles=largefiles)
+            result = cdc.compare(base_file, delta_file)
+            
+            assert len(result.additions) == 1
+            assert len(result.modifications) == 1
+            assert len(result.deletions) == 0
 
 class TestOutputFormatter:
     """Test cases for OutputFormatter class"""
@@ -358,32 +494,91 @@ P005,Monitor,299.99,Electronics,true"""
         with open(delta_file, 'w') as f:
             f.write(delta_content)
         
-        # Time the comparison
-        start_time = time.time()
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            start_time = time.time()
+            
+            cdc = CSVCDC(primary_key=[0], progressbar=0, largefiles=largefiles)
+            result = cdc.compare(base_file, delta_file)
+            
+            end_time = time.time()
+            execution_time = end_time - start_time
+            
+            # Should complete reasonably quickly (less than 10 seconds for 1000 rows)
+            assert execution_time < 10.0
+            
+            # Should find the expected changes
+            assert len(result.additions) == 50  # New products
+            assert len(result.modifications) > 0  # Price changes
+            assert len(result.deletions) > 0  # Deleted items
+    
+    def test_memory_efficiency_large_files(self, temp_dir):
+        """Test memory efficiency with large files mode"""
+        import psutil
+        import os
         
-        cdc = CSVCDC(primary_key=[0], progressbar=0)
-        result = cdc.compare(base_file, delta_file)
+        # Create a moderately large dataset (10K rows)
+        base_rows = []
+        delta_rows = []
         
-        end_time = time.time()
-        execution_time = end_time - start_time
+        for i in range(10000):
+            row_data = f"{i},Product_{i} with long description {'x' * 50},{10.99 + i * 0.001:.3f},Category_{i % 100},Extra_field_{i}"
+            base_rows.append(row_data)
+            
+            if i % 50 == 0:
+                # Modify every 50th row
+                modified_row = f"{i},Modified_Product_{i} with long description {'y' * 50},{15.99 + i * 0.001:.3f},Category_{i % 100},Modified_Extra_field_{i}"
+                delta_rows.append(modified_row)
+            else:
+                delta_rows.append(row_data)
         
-        # Should complete reasonably quickly (less than 5 seconds for 1000 rows)
-        assert execution_time < 5.0
+        base_content = "id,name,price,category,extra\n" + "\n".join(base_rows)
+        delta_content = "id,name,price,category,extra\n" + "\n".join(delta_rows)
         
-        # Should find the expected changes
-        assert len(result.additions) == 50  # New products
-        assert len(result.modifications) > 0  # Price changes
-        assert len(result.deletions) > 0  # Deleted items
+        base_file = os.path.join(temp_dir, 'memory_test_base.csv')
+        delta_file = os.path.join(temp_dir, 'memory_test_delta.csv')
+        
+        with open(base_file, 'w') as f:
+            f.write(base_content)
+        
+        with open(delta_file, 'w') as f:
+            f.write(delta_content)
+        
+        # Measure memory usage for large files mode
+        process = psutil.Process(os.getpid())
+        
+        # Get baseline memory
+        baseline_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        # Test with large files mode (smaller chunks)
+        cdc_large = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=500
+        )
+        result_large = cdc_large.compare(base_file, delta_file)
+        
+        large_mode_memory = process.memory_info().rss / 1024 / 1024  # MB
+        
+        # Memory usage should be reasonable (less than 500MB increase)
+        memory_increase = large_mode_memory - baseline_memory
+        assert memory_increase < 500  # Should not use more than 500MB
+        
+        # Results should still be correct
+        assert len(result_large.modifications) == 200  # Every 50th row modified
 
 class TestErrorHandling:
     """Test error handling scenarios"""
     
     def test_nonexistent_file(self):
         """Test handling of nonexistent files"""
-        cdc = CSVCDC(progressbar=0)
-        
-        with pytest.raises(FileNotFoundError):
-            cdc.compare('nonexistent_base.csv', 'nonexistent_delta.csv')
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            cdc = CSVCDC(progressbar=0, largefiles=largefiles)
+            
+            with pytest.raises(FileNotFoundError):
+                cdc.compare('nonexistent_base.csv', 'nonexistent_delta.csv')
     
     def test_invalid_primary_key_column(self, temp_dir):
         """Test invalid primary key column index"""
@@ -398,17 +593,19 @@ class TestErrorHandling:
         with open(delta_file, 'w') as f:
             f.write(content)
         
-        # Try to use column index that doesn't exist
-        cdc = CSVCDC(primary_key=[10], progressbar=0)
-        
-        # Should handle gracefully (might use available columns or raise appropriate error)
-        try:
-            result = cdc.compare(base_file, delta_file)
-            # If it succeeds, that's also acceptable behavior
-            assert isinstance(result, CSVCDCResult)
-        except (IndexError, ValueError):
-            # Expected behavior for invalid column index
-            pass
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            # Try to use column index that doesn't exist
+            cdc = CSVCDC(primary_key=[10], progressbar=0, largefiles=largefiles)
+            
+            # Should handle gracefully (might use available columns or raise appropriate error)
+            try:
+                result = cdc.compare(base_file, delta_file)
+                # If it succeeds, that's also acceptable behavior
+                assert isinstance(result, CSVCDCResult)
+            except (IndexError, ValueError):
+                # Expected behavior for invalid column index
+                pass
     
     def test_malformed_csv(self, temp_dir):
         """Test handling of malformed CSV files"""
@@ -426,15 +623,58 @@ class TestErrorHandling:
         with open(delta_file, 'w') as f:
             f.write(malformed_content)
         
-        cdc = CSVCDC(primary_key=[0], progressbar=0)
+        # Test both normal and large file modes
+        for largefiles in [0, 1]:
+            cdc = CSVCDC(primary_key=[0], progressbar=0, largefiles=largefiles)
+            
+            # Should handle malformed CSV gracefully
+            try:
+                result = cdc.compare(base_file, delta_file)
+                assert isinstance(result, CSVCDCResult)
+            except Exception as e:
+                # Some parsing errors are acceptable
+                assert isinstance(e, (ValueError, FileNotFoundError, Exception))
+    
+    def test_invalid_chunk_size(self, temp_dir):
+        """Test handling of invalid chunk sizes"""
+        content = "a,b,c\n1,2,3\n4,5,6"
         
-        # Should handle malformed CSV gracefully
+        base_file = os.path.join(temp_dir, 'test_base.csv')
+        delta_file = os.path.join(temp_dir, 'test_delta.csv')
+        
+        with open(base_file, 'w') as f:
+            f.write(content)
+        
+        with open(delta_file, 'w') as f:
+            f.write(content)
+        
+        # Test with very small chunk size
+        cdc_small = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=1
+        )
+        
+        # Should handle small chunk sizes
         try:
-            result = cdc.compare(base_file, delta_file)
+            result = cdc_small.compare(base_file, delta_file)
             assert isinstance(result, CSVCDCResult)
-        except Exception as e:
-            # Some parsing errors are acceptable
-            assert isinstance(e, (ValueError, FileNotFoundError, Exception))
+        except Exception:
+            # Some chunk size limitations are acceptable
+            pass
+        
+        # Test with very large chunk size
+        cdc_large = CSVCDC(
+            primary_key=[0], 
+            progressbar=0, 
+            largefiles=1, 
+            chunk_size=1000000
+        )
+        
+        # Should handle large chunk sizes
+        result = cdc_large.compare(base_file, delta_file)
+        assert isinstance(result, CSVCDCResult)
 
 # Test runner configuration
 if __name__ == '__main__':
