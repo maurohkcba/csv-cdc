@@ -19,10 +19,6 @@ A high-performance Change Data Capture (CDC) tool for comparing CSV files and de
 
 ## 📦 Installation
 
-### From PyPI (when published)
-```bash
-pip install csv-cdc
-```
 
 ### From Source
 ```bash
