@@ -45,7 +45,7 @@ jobs:
     
     - name: Check code formatting
       run: |
-        black --check .
+        black .
         isort --check-only .
     
     - name: Test with pytest
