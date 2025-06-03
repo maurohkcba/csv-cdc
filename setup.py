@@ -8,7 +8,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 
 setup(
     name="csv-cdc",
-    version="1.0.0",
+    version="1.0.1",
     author="Mauro Bartolomeu dos Reis",
     author_email="maurohktga@gmail.com",
     description="A high-performance CSV Change Data Capture tool",
@@ -36,6 +36,7 @@ setup(
     entry_points={
         "console_scripts": [
             "csvcdc=csvcdc:main",
+            "csv-cdc=csvcdc:main"
         ],
     },
     keywords="csv, diff, cdc, change-data-capture, data-comparison, file-comparison",
@@ -44,4 +45,8 @@ setup(
         "Source": "https://github.com/maurohkcba/csv-cdc/",
         "Documentation": "https://github.com/maurohkcba/csv-cdc/wiki",
     },
+    use_scm_version={
+    "local_scheme": "no-local-version",
+    },
+    setup_requires=["setuptools_scm"],
 )
