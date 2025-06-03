@@ -83,15 +83,9 @@ class CSVCDC:
                 header=None, 
                 dtype=str,
                 na_filter=False,
-                engine='c',  # Use C engine for speed
-                chunksize=self.chunk_size if self.largefiles == 1 else None
+                engine='c'  # Use C engine for speed
             )
-            
-            if self.largefiles == 1:
-                # For large files, we'll handle chunks separately
-                return df_pandas
-            else:
-                return pl.from_pandas(df_pandas)
+            return pl.from_pandas(df_pandas)
     
     def _read_csv_chunked(self, filepath: str):
         """Generator that yields chunks of the CSV file"""
@@ -129,6 +123,7 @@ class CSVCDC:
             base_sample = base_chunk.head(min(sample_size, len(base_chunk))).to_numpy().astype(str)
             delta_sample = delta_chunk.head(min(sample_size, len(delta_chunk))).to_numpy().astype(str)
         else:
+            # Read files normally for smaller files
             base_df = self._read_csv_optimized(base_file)
             delta_df = self._read_csv_optimized(delta_file)
             
@@ -304,21 +299,9 @@ class CSVCDC:
     def compare(self, base_file: str, delta_file: str) -> CSVCDCResult:
         """Compare two CSV files and return differences"""
         
-        # Auto-detect primary key if requested
+        # Auto-detect primary key if requested - always pass file paths
         if self.autopk:
-            if self.largefiles == 1:
-                self.primary_key = self._detect_primary_key(base_file, delta_file)
-            else:
-                # Read files first for non-large file mode
-                if self.progressbar:
-                    print("Reading base file...", file=sys.stderr)
-                base_df = self._read_csv_optimized(base_file)
-                
-                if self.progressbar:
-                    print("Reading delta file...", file=sys.stderr)
-                delta_df = self._read_csv_optimized(delta_file)
-                
-                self.primary_key = self._detect_primary_key(base_df, delta_df)
+            self.primary_key = self._detect_primary_key(base_file, delta_file)
         
         # Create hash maps based on large file mode
         if self.largefiles == 1:
@@ -327,14 +310,13 @@ class CSVCDC:
             delta_map = self._create_hash_map_chunked(delta_file, "Processing delta file")
         else:
             # Regular processing for smaller files
-            if not self.autopk:  # If autopk was used, files are already read
-                if self.progressbar:
-                    print("Reading base file...", file=sys.stderr)
-                base_df = self._read_csv_optimized(base_file)
-                
-                if self.progressbar:
-                    print("Reading delta file...", file=sys.stderr)
-                delta_df = self._read_csv_optimized(delta_file)
+            if self.progressbar:
+                print("Reading base file...", file=sys.stderr)
+            base_df = self._read_csv_optimized(base_file)
+            
+            if self.progressbar:
+                print("Reading delta file...", file=sys.stderr)
+            delta_df = self._read_csv_optimized(delta_file)
             
             base_map = self._create_hash_map(base_df, "Processing base file")
             delta_map = self._create_hash_map(delta_df, "Processing delta file")
@@ -478,8 +460,8 @@ def main():
                         help='Auto-detect primary key by analyzing data (default: 0)')
     parser.add_argument('--largefiles', type=int, default=0, choices=[0, 1],
                         help='Enable large file optimization with chunked processing (default: 0)')
-    parser.add_argument('--chunk-size', type=int, default=500000,
-                        help='Chunk size for large file processing (default: 500000)')
+    parser.add_argument('--chunk-size', type=int, default=50000,
+                        help='Chunk size for large file processing (default: 50000)')
     parser.add_argument('--version', action='version', version='csvcdc-python 1.0.0')
     
     args = parser.parse_args()
