@@ -104,7 +104,7 @@ jobs:
     
     - name: Run bandit security scan
       run: |
-        bandit -r . -x tests/
+        bandit -r . -x tests/ -c bandit.yaml
 
   build:
     runs-on: ubuntu-latest
